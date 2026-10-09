@@ -1,0 +1,38 @@
+[package]
+name = "rclip-sync"
+version = "0.1.0"
+edition = "2024"
+description = "Share the plain-text clipboard between machines on a local network"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "rclip"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "sync",
+    "macros",
+    "time",
+] }
+
+# Clipboard crates are platform-specific and cfg-gated so each build only ever
+# pulls in its own. See AGENTS.md §5.1 and §7.
+[target.'cfg(target_os = "linux")'.dependencies]
+wl-clipboard-rs = "0.9"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Both features are required and neither implies the other.
+#   monitor — the `Monitor` type, i.e. WM_CLIPBOARDUPDATE. Without it there is
+#            no event-driven watching on Windows at all.
+#   std    — forwards to `error-code/std`, which is what implements
+#            `std::error::Error` for `ErrorCode`. Without it none of the
+#            clipboard errors can be used with `anyhow`'s `.context(..)`.
+clipboard-win = { version = "5", features = ["monitor", "std"] }
