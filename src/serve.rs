@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use tokio::io::BufReader;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::{MissedTickBehavior, interval, timeout};
 
 use crate::clipboard;
 use crate::proto::{self, Message};
@@ -23,9 +23,35 @@ use crate::proto::{self, Message};
 /// (AGENTS.md §4.1).
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How long to wait for a peer's TCP handshake.
+///
+/// Deliberately shorter than [`RECONNECT_INTERVAL`]. A peer that is off, asleep
+/// or behind a dropping firewall leaves the SYN unanswered, and the kernel
+/// retries it for roughly two minutes before giving up. `reconnect` runs inside
+/// the select loop, so that wait is not just slow — it stops the loop calling
+/// `accept` or reading a clipboard change at all, which is silent from the
+/// outside: the peer's connect lands in the backlog and the peer logs a
+/// successful connection that we never acknowledge.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Run the daemon until the clipboard watcher stops.
 pub async fn run(peers: &[String], port: u16, bind: Ipv4Addr) -> Result<()> {
     let addresses = peer_addresses(peers, port)?;
+
+    // The watcher comes up before the socket does, and the order is load-bearing.
+    //
+    // `watch()` blocks: on Wayland `Watcher::new` does a round trip to the
+    // compositor, and the daemon is started at `graphical-session.target`, which
+    // is exactly when the compositor is busiest. Binding first would open the
+    // port while nothing was polling `accept()` — but the kernel completes
+    // inbound handshakes into the backlog regardless, so a peer would log a
+    // successful connection that we had not accepted yet, and this daemon would
+    // log nothing at all until the watcher returned. That reads as a peer that
+    // connects slowly, or not at all.
+    //
+    // Watching first also fails in the cheaper direction: a compositor with no
+    // data-control protocol exits before the port is opened, rather than after.
+    let mut changes = clipboard::watch()?;
 
     let listener = TcpListener::bind((bind, port))
         .await
@@ -52,7 +78,6 @@ pub async fn run(peers: &[String], port: u16, bind: Ipv4Addr) -> Result<()> {
     }
 
     let hub = Hub::new(addresses);
-    let mut changes = clipboard::watch()?;
 
     let mut reconnect = interval(RECONNECT_INTERVAL);
     reconnect.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -172,8 +197,10 @@ impl Hub {
                 continue;
             }
 
-            match TcpStream::connect(peer.address).await {
-                Ok(mut stream) => {
+            // Timed, because a peer that never answers must not hold the whole
+            // select loop hostage: see CONNECT_TIMEOUT.
+            match timeout(CONNECT_TIMEOUT, TcpStream::connect(peer.address)).await {
+                Ok(Ok(mut stream)) => {
                     // Say hello, so the peer's log records who arrived.
                     // Without this an inbound connection is indistinguishable
                     // from one that never happened, which makes diagnosing a
@@ -186,8 +213,9 @@ impl Hub {
                         peer.stream = Some(stream);
                     }
                 }
-                // Still down. Say nothing; trying again every tick is the point.
-                Err(_) => {}
+                // Still down, or never answered. Say nothing; trying again every
+                // tick is the point.
+                Ok(Err(_)) | Err(_) => {}
             }
         }
     }
